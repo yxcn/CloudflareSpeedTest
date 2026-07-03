@@ -2,24 +2,43 @@ package task
 
 import (
 	"bufio"
+	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const defaultInputFile = "ip.txt"
+const (
+	defaultInputFile       = "ip.txt"
+	defaultIPv6InputFile   = "ipv6.txt"
+	cloudflareIPv4URL      = "https://www.cloudflare.com/ips-v4"
+	cloudflareIPv6URL      = "https://www.cloudflare.com/ips-v6"
+	cloudflareFetchTimeout = 10 * time.Second
+)
 
 var (
 	// TestAll test all ip
 	TestAll = false
 	// IPFile is the filename of IP Rangs
 	IPFile = defaultInputFile
-	IPText string
+	// IPFileSpecified records whether the user passed -f explicitly.
+	IPFileSpecified = false
+	IPText          string
+	UseCloudflareIP = true
+	CloudflareIPv6  = false
 )
+
+type cloudflareIPSource struct {
+	name      string
+	url       string
+	cacheFile string
+}
 
 func InitRandSeed() {
 	rand.Seed(time.Now().UnixNano())
@@ -147,44 +166,199 @@ func (r *IPRanges) chooseIPv6() {
 	}
 }
 
+func (r *IPRanges) appendCIDR(ip string) {
+	r.parseCIDR(ip) // 解析 IP 段，获得 IP、IP 范围、子网掩码
+	if isIPv4(ip) { // 生成要测速的所有 IPv4 / IPv6 地址（单个/随机/全部）
+		r.chooseIPv4()
+	} else {
+		r.chooseIPv6()
+	}
+}
+
+func (r *IPRanges) loadIPText(text string) {
+	IPs := strings.Split(text, ",") // 以逗号分隔为数组并循环遍历
+	for _, IP := range IPs {
+		IP = strings.TrimSpace(IP) // 去除首尾的空白字符（空格、制表符、换行符等）
+		if IP == "" {              // 跳过空的（即开头、结尾或连续多个 ,, 的情况）
+			continue
+		}
+		r.appendCIDR(IP)
+	}
+}
+
+func (r *IPRanges) loadCIDRs(IPs []string) {
+	for _, IP := range IPs {
+		IP = strings.TrimSpace(IP)
+		if IP == "" {
+			continue
+		}
+		r.appendCIDR(IP)
+	}
+}
+
+func (r *IPRanges) loadIPFile(fileName string) {
+	r.loadCIDRs(readIPFileCIDRs(fileName))
+}
+
+func readIPFileCIDRs(fileName string) []string {
+	if fileName == "" {
+		fileName = defaultInputFile
+	}
+	file, err := os.Open(fileName)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	var cidrs []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() { // 循环遍历文件每一行
+		line := strings.TrimSpace(scanner.Text()) // 去除首尾的空白字符（空格、制表符、换行等）
+		if line == "" {                           // 跳过空行
+			continue
+		}
+		cidrs = append(cidrs, line)
+	}
+	if err := scanner.Err(); err != nil {
+		log.Fatal(err)
+	}
+	if err := validateCIDRs(cidrs); err != nil {
+		log.Fatal(err)
+	}
+	return cidrs
+}
+
+func shouldUseCloudflareIP() bool {
+	return UseCloudflareIP && IPText == "" && !IPFileSpecified
+}
+
+func cloudflareIPSources() []cloudflareIPSource {
+	sources := []cloudflareIPSource{
+		{name: "IPv4", url: cloudflareIPv4URL, cacheFile: defaultInputFile},
+	}
+	if CloudflareIPv6 {
+		sources = append(sources, cloudflareIPSource{name: "IPv6", url: cloudflareIPv6URL, cacheFile: defaultIPv6InputFile})
+	}
+	return sources
+}
+
+func loadCloudflareIPRanges() []string {
+	var cidrs []string
+	for _, source := range cloudflareIPSources() {
+		items, err := fetchCloudflareIPRangeURL(source.url)
+		if err != nil {
+			fmt.Printf("[警告] 从 Cloudflare 官网获取 %s IP 段失败：%v，回退读取本地缓存 %s\n", source.name, err, source.cacheFile)
+			items = readIPFileCIDRs(source.cacheFile)
+			fmt.Printf("[信息] 已从本地缓存 %s 读取 %s IP 段：%d 条\n", source.cacheFile, source.name, len(items))
+			cidrs = append(cidrs, items...)
+			continue
+		}
+
+		fmt.Printf("[信息] 已从 Cloudflare 官网获取 %s IP 段：%d 条\n", source.name, len(items))
+		if err := writeCIDRCache(source.cacheFile, items); err != nil {
+			fmt.Printf("[警告] 写入 %s 缓存失败：%v\n", source.cacheFile, err)
+		} else {
+			fmt.Printf("[信息] 已更新本地缓存 %s\n", source.cacheFile)
+		}
+		cidrs = append(cidrs, items...)
+	}
+	return cidrs
+}
+
+func fetchCloudflareIPRangeURL(url string) ([]string, error) {
+	client := http.Client{Timeout: cloudflareFetchTimeout}
+	res, err := client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", url, err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("%s: HTTP %s", url, res.Status)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", url, err)
+	}
+
+	cidrs := strings.Fields(string(body))
+	if err := validateCIDRs(cidrs); err != nil {
+		return nil, fmt.Errorf("%s: %w", url, err)
+	}
+	return cidrs, nil
+}
+
+func validateCIDRs(cidrs []string) error {
+	if len(cidrs) == 0 {
+		return fmt.Errorf("IP 段列表为空")
+	}
+	for _, cidr := range cidrs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("无效 IP 段 %q: %w", cidr, err)
+		}
+	}
+	return nil
+}
+
+func writeCIDRCache(fileName string, cidrs []string) error {
+	if err := validateCIDRs(cidrs); err != nil {
+		return err
+	}
+
+	lineEnding := detectLineEnding(fileName)
+	content := strings.Join(cidrs, lineEnding) + lineEnding
+	mode := os.FileMode(0644)
+	if info, err := os.Stat(fileName); err == nil {
+		mode = info.Mode().Perm()
+	}
+	tmpFile, err := os.CreateTemp(".", fileName+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmpFile.Name()
+	if err := tmpFile.Chmod(mode); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if _, err := tmpFile.WriteString(content); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, fileName); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+func detectLineEnding(fileName string) string {
+	body, err := os.ReadFile(fileName)
+	if err != nil {
+		return "\n"
+	}
+	if strings.Contains(string(body), "\r\n") {
+		return "\r\n"
+	}
+	return "\n"
+}
+
 func loadIPRanges() []*net.IPAddr {
 	ranges := newIPRanges()
 	if IPText != "" { // 从参数中获取 IP 段数据
-		IPs := strings.Split(IPText, ",") // 以逗号分隔为数组并循环遍历
-		for _, IP := range IPs {
-			IP = strings.TrimSpace(IP) // 去除首尾的空白字符（空格、制表符、换行符等）
-			if IP == "" {              // 跳过空的（即开头、结尾或连续多个 ,, 的情况）
-				continue
-			}
-			ranges.parseCIDR(IP) // 解析 IP 段，获得 IP、IP 范围、子网掩码
-			if isIPv4(IP) {      // 生成要测速的所有 IPv4 / IPv6 地址（单个/随机/全部）
-				ranges.chooseIPv4()
-			} else {
-				ranges.chooseIPv6()
-			}
-		}
-	} else { // 从文件中获取 IP 段数据
-		if IPFile == "" {
-			IPFile = defaultInputFile
-		}
-		file, err := os.Open(IPFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer file.Close()
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() { // 循环遍历文件每一行
-			line := strings.TrimSpace(scanner.Text()) // 去除首尾的空白字符（空格、制表符、换行符等）
-			if line == "" {                           // 跳过空行
-				continue
-			}
-			ranges.parseCIDR(line) // 解析 IP 段，获得 IP、IP 范围、子网掩码
-			if isIPv4(line) {      // 生成要测速的所有 IPv4 / IPv6 地址（单个/随机/全部）
-				ranges.chooseIPv4()
-			} else {
-				ranges.chooseIPv6()
-			}
-		}
+		ranges.loadIPText(IPText)
+		return ranges.ips
 	}
+
+	if shouldUseCloudflareIP() {
+		ranges.loadCIDRs(loadCloudflareIPRanges())
+		return ranges.ips
+	}
+
+	ranges.loadIPFile(IPFile) // 从文件中获取 IP 段数据
 	return ranges.ips
 }

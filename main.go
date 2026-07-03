@@ -57,9 +57,13 @@ https://github.com/XIU2/CloudflareSpeedTest
     -p 10
         显示结果数量；测速后直接显示指定数量的结果，为 0 时不显示结果直接退出；(默认 10 个)
     -f ip.txt
-        IP段数据文件；如路径含有空格请加上引号；支持其他 CDN IP段；(默认 ip.txt)
+        IP段数据文件；显式指定时跳过 Cloudflare 官网实时获取；支持其他 CDN IP段；(默认 ip.txt)
     -ip 1.1.1.1,2.2.2.2/24,2606:4700::/32
         指定IP段数据；直接通过参数指定要测速的 IP 段数据，英文逗号分隔；(默认 空)
+    -cfip true
+        从 Cloudflare 官网实时获取 IP 段并更新本地缓存；未显式指定 [-f] 或 [-ip] 时生效；(默认 true)
+    -cfipv6 false
+        搭配 [-cfip] 使用，同时获取 Cloudflare IPv6 IP段并更新 ipv6.txt；(默认 false)
     -o result.csv
         写入结果文件；如路径含有空格请加上引号；值为空时不写入文件 [-o ""]；(默认 result.csv)
 
@@ -97,6 +101,8 @@ https://github.com/XIU2/CloudflareSpeedTest
 	flag.IntVar(&utils.PrintNum, "p", 10, "显示结果数量")
 	flag.StringVar(&task.IPFile, "f", "ip.txt", "IP段数据文件")
 	flag.StringVar(&task.IPText, "ip", "", "指定IP段数据")
+	flag.BoolVar(&task.UseCloudflareIP, "cfip", true, "从 Cloudflare 官网实时获取 IP 段")
+	flag.BoolVar(&task.CloudflareIPv6, "cfipv6", false, "同时获取 Cloudflare IPv6 IP 段")
 	flag.StringVar(&utils.Output, "o", "result.csv", "输出结果文件")
 
 	flag.BoolVar(&task.Disable, "dd", false, "禁用下载测速")
@@ -107,6 +113,11 @@ https://github.com/XIU2/CloudflareSpeedTest
 	flag.BoolVar(&printVersion, "v", false, "打印程序版本")
 	flag.Usage = func() { fmt.Print(help) }
 	flag.Parse()
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "f" {
+			task.IPFileSpecified = true
+		}
+	})
 
 	if task.MinSpeed > 0 && time.Duration(maxDelay)*time.Millisecond == utils.InputMaxDelay {
 		utils.Yellow.Println("[提示] 在使用 [-sl] 参数时，建议搭配 [-tl] 参数，以避免因凑不够 [-dn] 数量而一直测速...")
